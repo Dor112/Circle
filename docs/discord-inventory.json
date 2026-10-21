@@ -1,0 +1,66 @@
+{
+  "source": "Discord/app-1.0.9262/resources/app.asar",
+  "package": {
+    "name": "discord",
+    "license": "UNLICENSED",
+    "description": "Discord Client for Desktop - Bootstrapper",
+    "main": "bundle.js",
+    "private": true,
+    "scripts": {
+      "eslint": "eslint . --ext .ts,.tsx --color --quiet",
+      "prettier": "prettier --write .",
+      "tsc": "tsc --pretty"
+    },
+    "dependencies": {
+      "@sentry/browser": "10.50.0",
+      "@sentry/electron": "7.13.0",
+      "@sentry/types": "10.50.0",
+      "@types/node": "20.19.11",
+      "@types/request": "^2.48.5",
+      "arch": "2.2.0",
+      "electron-log": "5.2.0",
+      "request": "2.88.0",
+      "yauzl": "^2.10.0"
+    },
+    "devDependencies": {
+      "electron": "42.7.1"
+    },
+    "pnpm": {
+      "patchedDependencies": {
+        "@sentry/electron@7.13.0": "patches/@sentry__electron@7.13.0.patch"
+      }
+    }
+  },
+  "bundle": [
+    {
+      "term": "discord.com",
+      "offset": 2831,
+      "snippet": "eleaseChannel.slice(1);exports.APP_COMPANY=\"Discord Inc\",exports.APP_DESCRIPTION=\"Discord - https://discord.com\",exports.APP_NAME=\"Discord\"+appNameSuffix,exports.APP_NAME_FOR_HUMANS=\"Discord\"+(\"\"!==appNameSuffix?\" \"+appNameSuffix:\"\"),exports.APP_ID=`com.squirrel.${exports.APP_NAME}.${exports.APP_NAM"
+    },
+    {
+      "term": "BrowserWindow",
+      "offset": 91681,
+      "snippet": "ditionalArguments:[`--splash-media-format=${useWebp?\"webp\":\"webm\"}`]}},(splashWindow=new electron_1.BrowserWindow(windowConfig)).webContents.on(\"console-message\",logger.ipcMainRendererLogger),splashWindow.webContents.on(\"will-navigate\",e=>e.preventDefault()),splashWindow.webContents.setWindowOpenHan"
+    },
+    {
+      "term": "contextIsolation",
+      "offset": 91495,
+      "snippet": "ransparent:!1,frame:!1,resizable:!1,center:!0,show:!1,webPreferences:{nodeIntegration:!1,sandbox:!1,contextIsolation:!0,preload:path_1.default.join(__dirname,\"splashScreenPreload.js\"),additionalArguments:[`--splash-media-format=${useWebp?\"webp\":\"webm\"}`]}},(splashWindow=new electron_1.BrowserWindow("
+    },
+    {
+      "term": "nodeIntegration",
+      "offset": 91465,
+      "snippet": "height:LOADING_WINDOW_HEIGHT,transparent:!1,frame:!1,resizable:!1,center:!0,show:!1,webPreferences:{nodeIntegration:!1,sandbox:!1,contextIsolation:!0,preload:path_1.default.join(__dirname,\"splashScreenPreload.js\"),additionalArguments:[`--splash-media-format=${useWebp?\"webp\":\"webm\"}`]}},(splashWindow"
+    },
+    {
+      "term": "webContents",
+      "offset": 91710,
+      "snippet": "media-format=${useWebp?\"webp\":\"webm\"}`]}},(splashWindow=new electron_1.BrowserWindow(windowConfig)).webContents.on(\"console-message\",logger.ipcMainRendererLogger),splashWindow.webContents.on(\"will-navigate\",e=>e.preventDefault()),splashWindow.webContents.setWindowOpenHandler(details=>((0,securityUti"
+    },
+    {
+      "term": "discord_voice",
+      "offset": -1,
+      "snippet": "unknown"
+    }
+  ]
+}

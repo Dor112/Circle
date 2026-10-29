@@ -27,3 +27,91 @@ test('voice signaling only reaches participants in the same authorized room',asy
 test('kicking revokes text, file and active voice access',async()=>{const kicked=event(bob.socket,'voice:kicked');await request(alice.cookie,`/guilds/${gid}/members/${bob.user.id}`,'DELETE');await kicked;assert.equal((await request(bob.cookie,`/rooms/${text}/messages`)).status,403);assert.equal((await request(bob.cookie,`/uploads/${uploadId}`)).status,403);assert.ok((await bob.socket.emitWithAck('voice:join',voice)).error);});
 test('logout invalidates the session and disconnects its socket',async()=>{const disconnected=event(bob.socket,'disconnect');assert.equal((await request(bob.cookie,'/logout','POST',{})).status,200);await disconnected;assert.equal((await request(bob.cookie,'/state')).status,401);});
 test('SQLite retains accounts and history across server restart',async()=>{clients.forEach(s=>s.disconnect());await stop();await start();const r=await request(alice.cookie,`/rooms/${text}/messages`);assert.equal(r.status,200);assert.equal(r.json.find(m=>m.id===mid).body,'Hello updated');assert.equal((await request(alice.cookie,'/state')).json.guilds[0].name,'Friends');});
+
+test('native login posts credentials in the body and redirects to a clean URL',async()=>{
+  const html=await (await fetch(base+'/')).text();
+  assert.match(html,/<form id="auth-form" method="post" action="\/">/);
+  const post=(fields,origin=base)=>fetch(base+'/',{method:'POST',redirect:'manual',headers:{Origin:origin},body:new URLSearchParams(fields)});
+  const fields={username:'native_user',password:'native-password-123',auth_action:'register'};
+  const registered=await post(fields);
+  assert.equal(registered.status,303);
+  assert.equal(registered.headers.get('location'),'/');
+  assert.equal(registered.headers.get('cache-control'),'no-store');
+  const cookie=registered.headers.get('set-cookie').split(';')[0];
+  assert.equal((await request(cookie,'/state')).json.user.username,'native_user');
+  const loggedIn=await post({...fields,auth_action:'login'});
+  assert.equal(loggedIn.status,303);
+  assert.ok(loggedIn.headers.get('set-cookie'));
+  const wrong=await post({...fields,auth_action:'login',password:'wrong-password-123'});
+  assert.equal(wrong.status,401);
+  assert.equal(wrong.headers.get('set-cookie'),null);
+  assert.ok(!(await wrong.text()).includes('wrong-password-123'));
+  assert.equal((await post(fields,'https://untrusted.example')).status,403);
+});
+
+test('socket reads use the same authorization and data as HTTP routes',async()=>{
+  const a=await connect(alice),o=await connect(outsider);
+  const read=(client,path)=>client.timeout(2000).emitWithAck('data:read',{path});
+  assert.equal((await read(a,'/state')).data.user.id,alice.user.id);
+  const expected=(await request(alice.cookie,`/rooms/${text}/messages?search=updated`)).json;
+  assert.deepEqual((await read(a,`/rooms/${text}/messages?search=updated`)).data,expected);
+  assert.ok((await read(o,`/rooms/${text}/messages`)).error);
+  assert.ok((await read(a,'/logout')).error);
+  assert.ok((await read(a,'https://untrusted.example/state')).error);
+  assert.ok((await read(a,'/rooms/unknown/messages')).error);
+  assert.ok((await read(a,'/rtc')).data.iceServers[0].urls.startsWith('stun:'));
+  const temporary=await register('socket_expiry');const client=await connect(temporary);
+  const disconnected=event(client,'disconnect');
+  await request(temporary.cookie,'/logout','POST',{});
+  await disconnected;assert.equal(client.connected,false);
+  const denied=io(base,{extraHeaders:{Cookie:temporary.cookie},transports:['websocket'],reconnection:false});clients.push(denied);
+  const [error]=await once(denied,'connect_error');assert.equal(error.message,'Войдите в аккаунт');denied.disconnect();
+});
+
+test('voice join retries do not kick the same socket or duplicate membership',async()=>{
+  const a=await connect(alice),b=await connect(outsider);
+  const newGuild=(await request(alice.cookie,'/guilds','POST',{name:'Voice retry test'})).json.id;
+  const code=(await request(alice.cookie,`/guilds/${newGuild}/invites`,'POST',{})).json.code;
+  await request(outsider.cookie,`/invites/${code}`,'POST',{});
+  const channel=(await request(alice.cookie,`/guilds/${newGuild}/channels`,'POST',{name:'Voice',kind:'voice'})).json.id;
+  let kicked=0;a.on('voice:kicked',()=>kicked++);
+  assert.deepEqual((await a.emitWithAck('voice:join',channel)).peers,[]);
+  await b.emitWithAck('voice:join',channel);
+  const retried=await a.emitWithAck('voice:join',channel);
+  assert.deepEqual(retried.peers.map(p=>p.socketId),[b.id]);
+  assert.equal(kicked,0);
+  const snapshot=(await a.emitWithAck('data:read',{path:'/state'})).data;
+  assert.equal(snapshot.voice.filter(v=>v.room===channel).length,2);
+  const another=(await request(alice.cookie,`/guilds/${newGuild}/channels`,'POST',{name:'Other',kind:'voice'})).json.id;
+  await a.emitWithAck('voice:join',another);assert.equal(kicked,0);
+  const replacement=await connect(alice),oldKicked=event(a,'voice:kicked');
+  await replacement.emitWithAck('voice:join',another);await oldKicked;assert.equal(kicked,1);
+  a.disconnect();b.disconnect();replacement.disconnect();
+});
+
+test('voice mailbox recovers lost signals, deduplicates retries and enforces socket ownership',async()=>{
+  const a=await connect(alice),b=await connect(outsider);
+  const channel=(await request(alice.cookie,'/dms','POST',{username:'outsider'})).json.id;
+  await a.emitWithAck('voice:join',channel);await b.emitWithAck('voice:join',channel);
+  const offer={id:'first-offer',to:b.id,description:{type:'offer',sdp:'offer-sdp'}};
+  assert.deepEqual(await a.emitWithAck('voice:signal',offer),{ok:true});
+  const read=()=>request(outsider.cookie,'/voice/signals/read','POST',{socketId:b.id,ack:[]});
+  let r=await read();assert.equal(r.status,200);assert.equal(r.json.messages.length,1);
+  const message=r.json.messages[0];assert.equal(message.from,a.id);assert.equal(message.description.sdp,'offer-sdp');
+  await a.emitWithAck('voice:signal',offer);r=await read();assert.deepEqual(r.json.messages,[message]);
+  assert.equal((await request(alice.cookie,'/voice/signals/read','POST',{socketId:b.id,ack:[message.id]})).status,403);
+  assert.deepEqual((await read()).json.messages,[message]);
+  await request(outsider.cookie,'/voice/signals/read','POST',{socketId:b.id,ack:[message.id]});
+  assert.deepEqual((await read()).json.messages,[]);
+  const candidate={id:'ice-fallback',to:b.id,candidate:{candidate:'candidate:example',sdpMid:'0',sdpMLineIndex:0,usernameFragment:'abc'}};
+  assert.equal((await request(alice.cookie,'/voice/signals','POST',{socketId:a.id,...candidate})).status,200);
+  assert.deepEqual((await read()).json.messages[0].candidate,candidate.candidate);
+  assert.equal((await request(alice.cookie,'/voice/signals','POST',{socketId:b.id,...candidate})).status,403);
+  assert.equal((await request(alice.cookie,'/voice/signals','POST',{socketId:a.id,...offer,to:'unknown'})).status,403);
+  assert.equal((await request(alice.cookie,'/voice/signals','POST',{socketId:a.id,...offer,description:{type:'offer',sdp:'x'.repeat(20001)}})).status,400);
+  for(let n=0;n<127;n++)assert.ok((await a.emitWithAck('voice:signal',{...candidate,id:`bounded-${n}`})).ok);
+  assert.ok((await a.emitWithAck('voice:signal',{...candidate,id:'overflow'})).error);
+  await a.emitWithAck('voice:join',voice);
+  assert.deepEqual((await read()).json.messages,[]);
+  a.disconnect();b.disconnect();
+});

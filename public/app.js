@@ -1,13 +1,34 @@
+import { mergeHistory } from './message-history.js';
+import { abortable, waitForVoiceConnection, joinVoice } from './voice-transport.js';
+import { createVoiceSignaling, createNegotiator } from './voice-signaling.js';
+import { loadLivekit, createLivekitCall } from './livekit-call.js?v=20261029-cache1';
+// Remove credentials left by a native form submission before further requests.
+const pageUrl = new URL(location.href);
+if (['username','display_name','password'].some(key => pageUrl.searchParams.has(key))) {
+  for (const key of ['username','display_name','password']) pageUrl.searchParams.delete(key);
+  history.replaceState(null,'',pageUrl.pathname+pageUrl.search+pageUrl.hash);
+}
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const initials = name => String(name).split(/\s+/).map(x=>x[0]).join('').slice(0,2).toUpperCase();
 let state, socket, guildId=null, room=null, messages=[], search='', pendingFile=null, registration=false, generation=0;
 let voiceRoom=null, localStream=null, videoStream=null, videoMode=null, muted=false, deafened=false, rtcConfig, joining=false, dmCallView=false;
+let callIntent=null,callAbort=null,callRetryTimer,callRetryCount=0;
+let voiceSignaling=null;
+let livekitCall=null;
+let loadingVoiceSdk=false,voiceSdkProgress=0;
 const peers=new Map(), typingTimers=new Map();
+const pendingHistory=new Set();
+function recordMessageChange(id,value){for(const changes of pendingHistory)changes.set(id,value);}
 let toastTimer;
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,5000);}
 async function api(url,method='GET',body){
-  const r=await fetch(`/api${url}`,{method,headers:body instanceof FormData?{}:{'Content-Type':'application/json'},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});
+  if(method==='GET'&&socket?.connected&&(/^\/(state|rtc)$/.test(url)||/^\/rooms\/[^/]+\/messages(?:\?|$)/.test(url))){
+    const result=await socket.timeout(10000).emitWithAck('data:read',{path:url});
+    if(result.error)throw new Error(result.error);
+    return result.data;
+  }
+  const r=await fetch(`/api${url}`,{method,headers:body instanceof FormData?{}:{'Content-Type':'application/json'},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined,signal:/^\/rooms\/[^/]+\/livekit$/.test(url)?AbortSignal.timeout(15000):undefined});
   const result=await r.json();if(!r.ok){if(r.status===401&&state){leaveCall();socket?.disconnect();state=null;$('app').hidden=true;$('auth').hidden=false;}throw new Error(result.error||'Ошибка запроса');}return result;
 }
 function action(fn){return async(...args)=>{try{await fn(...args);}catch(e){toast(e.message);}};}
@@ -19,21 +40,40 @@ function modal(title,description,fields,submit='Готово',callback){
 }
 $('modal-close').onclick=()=>$('modal').close();
 $('modal-form').onsubmit=async e=>{e.preventDefault();$('modal-submit').disabled=true;try{const values=Object.fromEntries(new FormData(e.target));await modalCallback(values);$('modal').close();}catch(e){$('modal-error').textContent=e.message;}finally{$('modal-submit').disabled=false;}};
-$('auth-toggle').onclick=()=>{registration=!registration;$('display-field').hidden=!registration;$('auth-title').textContent=registration?'Найдите свой Круг.':'С возвращением.';$('auth-subtitle').textContent=registration?'Один аккаунт для всех ваших компаний.':'Ваш круг всегда рядом.';$('auth-submit').textContent=registration?'Создать аккаунт →':'Войти в Круг →';$('auth-toggle').textContent=registration?'Уже есть аккаунт? Войти':'Впервые здесь? Создать аккаунт';$('auth-form').elements.password.autocomplete=registration?'new-password':'current-password';$('auth-error').textContent='';};
+$('auth-toggle').onclick=()=>{registration=!registration;$('auth-form').elements.auth_action.value=registration?'register':'login';$('display-field').hidden=!registration;$('auth-title').textContent=registration?'Найдите свой Круг.':'С возвращением.';$('auth-subtitle').textContent=registration?'Один аккаунт для всех ваших компаний.':'Ваш круг всегда рядом.';$('auth-submit').textContent=registration?'Создать аккаунт →':'Войти в Круг →';$('auth-toggle').textContent=registration?'Уже есть аккаунт? Войти':'Впервые здесь? Создать аккаунт';$('auth-form').elements.password.autocomplete=registration?'new-password':'current-password';$('auth-error').textContent='';};
 $('auth-form').onsubmit=async e=>{e.preventDefault();$('auth-submit').disabled=true;$('auth-error').textContent='';try{await api(`/auth/${registration?'register':'login'}`,'POST',Object.fromEntries(new FormData(e.target)));await boot();}catch(e){$('auth-error').textContent=e.message;}finally{$('auth-submit').disabled=false;}};
 async function boot(){
-  state=await api('/state');$('auth').hidden=true;$('app').hidden=false;
-  socket?.disconnect();socket=io({autoConnect:false});
-  socket.on('connect',()=>{$('connection').textContent='● В сети';$('connection').classList.remove('offline');if(room){socket.emit('room:join',room.id);loadMessages().catch(e=>toast(e.message));}refreshState().catch(e=>toast(e.message));});
-  socket.on('disconnect',()=>{$('connection').textContent='● Переподключение';$('connection').classList.add('offline');if(voiceRoom){leaveCall();toast('Соединение потеряно. Войдите в голосовой канал снова.');}});
+  socket?.disconnect();socket=io({autoConnect:false,transports:['websocket','polling'],tryAllTransports:true});
+  const initialSocket=socket;
+  await new Promise((resolve,reject)=>{
+    const cleanup=()=>{clearTimeout(timer);initialSocket.off('connect',ready);initialSocket.off('connect_error',failed);};
+    const ready=()=>{cleanup();resolve();};
+    const failed=error=>{cleanup();initialSocket.disconnect();reject(error);};
+    const timer=setTimeout(()=>failed(new Error('Не удалось подключиться к серверу. Повторите вход.')),15000);
+    initialSocket.once('connect',ready);initialSocket.once('connect_error',failed);initialSocket.connect();
+  });
+  try{state=await api('/state');}catch(error){initialSocket.disconnect();throw error;}
+  $('auth').hidden=true;$('app').hidden=false;
+  $('connection').textContent='● В сети';$('connection').classList.remove('offline');
+  socket.on('connect',()=>{$('connection').textContent='● В сети';$('connection').classList.remove('offline');if(room){socket.emit('room:join',room.id);if(room.kind!=='voice')loadMessages(undefined,true).catch(e=>toast(e.message));}refreshState().catch(e=>toast(e.message));if(livekitCall?.ready&&voiceRoom){joinVoice(socket,voiceRoom).then(()=>{if(muted)socket.emit('voice:mute',true);}).catch(e=>{leaveCall();toast(e.message);});}else if(callIntent&&!voiceRoom&&!joining){clearTimeout(callRetryTimer);startCall(callIntent,true).catch(e=>toast(e.message));}});
+  socket.on('disconnect',()=>{
+    $('connection').textContent='● Переподключение';$('connection').classList.add('offline');
+    if(livekitCall?.ready||joining&&rtcConfig?.provider==='livekit')return;
+    const wanted=callIntent||voiceRoom;
+    if(wanted){
+      const wasMuted=muted,wasDeafened=deafened;leaveCall();callIntent=wanted;muted=wasMuted;deafened=wasDeafened;
+      toast('Соединение потеряно. Восстанавливаем вход в звонок…');renderCall();
+      callRetryTimer=setTimeout(()=>{if(callIntent&&!voiceRoom){leaveCall();toast('Связь не восстановилась. Подключитесь к звонку снова.');}},30000);
+    }
+  });
   socket.on('connect_error',e=>{ $('connection').textContent='● Нет соединения';$('connection').classList.add('offline'); });
   socket.on('refresh',()=>refreshState().catch(e=>toast(e.message)));
-  socket.on('message',m=>{if(m.room!==room?.id)return;if(search&&!m.body.toLowerCase().includes(search.toLowerCase()))return;if(!messages.some(x=>x.id===m.id))messages.push(m);renderMessages();scrollDown();});
-  socket.on('message:update',m=>{if(m.room!==room?.id)return;messages=messages.map(x=>x.id===m.id?m:x);renderMessages();});
-  socket.on('message:delete',m=>{if(m.room===room?.id){messages=messages.filter(x=>x.id!==m.id);renderMessages();}});
+  socket.on('message',m=>{if(m.room!==room?.id)return;if(search&&!m.body.toLowerCase().includes(search.toLowerCase()))return;recordMessageChange(m.id,m);if(!messages.some(x=>x.id===m.id))messages.push(m);renderMessages();scrollDown();});
+  socket.on('message:update',m=>{if(m.room!==room?.id)return;recordMessageChange(m.id,search&&!m.body.toLowerCase().includes(search.toLowerCase())?null:m);messages=messages.map(x=>x.id===m.id?m:x);renderMessages();});
+  socket.on('message:delete',m=>{if(m.room===room?.id){recordMessageChange(m.id,null);messages=messages.filter(x=>x.id!==m.id);renderMessages();}});
   socket.on('typing',({room:id,user})=>{if(id!==room?.id)return;clearTimeout(typingTimers.get(user.id));$('typing').textContent=`${user.display_name} печатает…`;typingTimers.set(user.id,setTimeout(()=>$('typing').textContent='',2000));});
   socket.on('voice:state',v=>{state.voice=v;renderChannels();renderCall();});
-  socket.on('voice:signal',action(handleSignal));socket.on('voice:left',({socketId})=>{closePeer(socketId);renderCall();});socket.on('voice:kicked',()=>{leaveCall();toast('Вы отключены от голосового канала.');});
+  socket.on('voice:signal',message=>voiceSignaling?.receive(message));socket.on('voice:left',({socketId})=>{closePeer(socketId);renderCall();});socket.on('voice:kicked',()=>{leaveCall();toast('Вы отключены от голосового канала.');});
   socket.connect();render();
   const invite=new URLSearchParams(location.search).get('invite');if(invite){history.replaceState({},'',location.pathname);joinGuild(invite);}
 }
@@ -82,7 +122,18 @@ $('server-title').onclick=()=>{const g=currentGuild();if(g&&g.owner_id!==state.u
 $('profile').onclick=()=>modal('Ваш профиль','Это имя видят ваши друзья.',[{name:'display_name',label:'Отображаемое имя',value:state.user.display_name,max:40}],'Сохранить',async v=>{await api('/profile','PATCH',v);await refreshState();});
 $('logout').onclick=action(async()=>{await api('/logout','POST',{});leaveCall();socket.disconnect();state=null;room=null;guildId=null;$('app').hidden=true;$('auth').hidden=false;$('auth-form').reset();});
 $('toggle-members').onclick=()=>$('app').classList.toggle('members-hidden');$('mobile-menu').onclick=()=>$('app').classList.toggle('show-sidebar');
-async function loadMessages(before){if(!room||room.kind==='voice')return;const seq=++generation,id=room.id;const list=await api(`/rooms/${id}/messages?search=${encodeURIComponent(search)}${before?`&before=${before}`:''}`);if(seq!==generation||room?.id!==id)return;const oldHeight=$('messages').scrollHeight;messages=before?[...list,...messages]:list;renderMessages();$('load-older').hidden=list.length<50;if(before)$('messages').scrollTop=$('messages').scrollHeight-oldHeight;else scrollDown();}
+async function loadMessages(before,preserveOlder=false){
+  if(!room||room.kind==='voice')return;
+  const seq=++generation,id=room.id,changes=new Map();pendingHistory.add(changes);
+  try{
+    const list=await api(`/rooms/${id}/messages?search=${encodeURIComponent(search)}${before?`&before=${before}`:''}`);
+    if(seq!==generation||room?.id!==id)return;
+    const oldHeight=$('messages').scrollHeight;
+    messages=mergeHistory(messages,list,{before:!!before,preserveOlder,changes});
+    renderMessages();$('load-older').hidden=list.length<50;
+    if(before)$('messages').scrollTop=$('messages').scrollHeight-oldHeight;else scrollDown();
+  }finally{pendingHistory.delete(changes);}
+}
 function scrollDown(){$('messages').scrollTop=$('messages').scrollHeight;}
 function formatBody(body){return esc(body).replace(/https?:\/\/[^\s<>]+/g,url=>`<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);}
 function renderMessages(){
@@ -102,57 +153,99 @@ $('composer').onsubmit=action(async e=>{e.preventDefault();const body=$('message
 let lastTyping=0;$('message-input').oninput=()=>{const t=$('message-input');t.style.height='auto';t.style.height=`${Math.min(t.scrollHeight,140)}px`;if(room&&Date.now()-lastTyping>1200){socket.emit('typing',room.id);lastTyping=Date.now();}};
 $('message-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('composer').requestSubmit();}};$('emoji').onclick=()=>{$('message-input').value+=' 👋';$('message-input').focus();};
 
-// One initial offer from each newcomer; a reserved video transceiver permits
-// switching camera/screen without renegotiation or simultaneous-offer glare.
-async function startCall(id){
-  if(joining)return;joining=true;$('join-call').disabled=true;
+// The backend selects LiveKit or the original peer-to-peer media transport.
+async function startCall(id,recovering=false){
+  if(joining||voiceRoom===id)return;
+  if(voiceRoom)leaveCall();
+  clearTimeout(callRetryTimer);callAbort?.abort();const controller=new AbortController();callAbort=controller;
+  const active=()=>callAbort===controller&&!controller.signal.aborted;
+  callIntent=id;if(!recovering){callRetryCount=0;muted=false;deafened=false;}
+  joining=true;$('join-call').disabled=true;renderCall();
   try{
-    if(voiceRoom===id)return;if(voiceRoom)leaveCall();
     if(!navigator.mediaDevices?.getUserMedia)throw new Error('Для микрофона откройте приложение через HTTPS или localhost.');
-    rtcConfig=await api('/rtc');localStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-    const result=await socket.timeout(8000).emitWithAck('voice:join',id);if(result.error)throw new Error(result.error);
-    voiceRoom=id;muted=false;deafened=false;
-    for(const p of result.peers){const peer=createPeer(p.socketId);await peer.pc.setLocalDescription(await peer.pc.createOffer());signal(p.socketId,{description:peer.pc.localDescription});}
+    await waitForVoiceConnection(socket,{signal:controller.signal});
+    rtcConfig=await abortable(api('/rtc'),controller.signal);if(!active())return;
+    if(rtcConfig.provider==='livekit'){
+      loadingVoiceSdk=true;voiceSdkProgress=0;renderCall();
+      const sdk=await abortable(loadLivekit(percent=>{if(active()){voiceSdkProgress=percent;renderCall();}}),controller.signal);if(!active())return;
+      loadingVoiceSdk=false;renderCall();
+      await joinVoice(socket,id,{signal:controller.signal});if(!active())return;
+      const joinedSocket=socket.id;
+      const credentials=await abortable(api(`/rooms/${id}/livekit`,'POST',{socketId:joinedSocket}),controller.signal);if(!active())return;
+      if(!socket.connected||socket.id!==joinedSocket)throw Object.assign(new Error('Связь с чатом изменилась во время входа. Повторяем подключение.'),{code:'VOICE_TRANSPORT'});
+      const call=createLivekitCall({sdk,channel:id,onChange:()=>{if(livekitCall===call){videoMode=call.videoMode;renderCall();}},onDisconnect:()=>{if(livekitCall===call){leaveCall();toast('Соединение LiveKit завершилось. Подключитесь к каналу снова.');}},onError:error=>{if(active())toast(error.message);}});
+      livekitCall=call;controller.signal.addEventListener('abort',()=>call.stop(),{once:true});
+      await call.connect(credentials.url,credentials.token,muted);if(!active())return;
+      voiceRoom=id;callRetryCount=0;await call.deafen(deafened);renderCall();renderChannels();return;
+    }
+    const captured=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+    if(!active()){captured.getTracks().forEach(t=>t.stop());return;}
+    localStream=captured;localStream.getAudioTracks().forEach(t=>t.enabled=!muted);
+    const result=await joinVoice(socket,id,{signal:controller.signal});if(!active())return;
+    voiceRoom=id;callRetryCount=0;
+    voiceSignaling=createVoiceSignaling({socket,receive:handleSignal,signal:controller.signal,onError:error=>toast(error.message)});
+    for(const p of result.peers){const peer=createPeer(p.socketId);await peer.negotiator.offer();if(!active())return;}
+    if(muted)socket.emit('voice:mute',true);
     renderCall();renderChannels();
-  }catch(e){leaveCall();throw new Error(e.name==='NotAllowedError'?'Разрешите браузеру доступ к микрофону в настройках сайта.':e.message);}
-  finally{joining=false;$('join-call').disabled=false;}
+  }catch(e){
+    if(!active())return;
+    const transient=e.code==='VOICE_TRANSPORT'||e.name==='TimeoutError'||/operation has timed out|socket has been disconnected/i.test(e.message);
+    const wasMuted=muted,wasDeafened=deafened;leaveCall();
+    if(transient&&callRetryCount<2){
+      callRetryCount++;callIntent=id;muted=wasMuted;deafened=wasDeafened;renderCall();
+      toast('Нет подтверждения сервера. Повторяем подключение к звонку…');
+      callRetryTimer=setTimeout(()=>{if(callIntent===id)startCall(id,true).catch(error=>toast(error.message));},1500);
+      return;
+    }
+    throw new Error(e.name==='NotAllowedError'?'Разрешите браузеру доступ к микрофону в настройках сайта.':e.message);
+  }finally{if(active()){joining=false;$('join-call').disabled=false;renderCall();}}
 }
-function signal(to,payload){socket.emit('voice:signal',{to,...payload},r=>{if(r?.error)toast(r.error);});}
+function signal(to,payload){return voiceSignaling?.send(to,payload)||Promise.resolve();}
 function createPeer(id){
   if(peers.has(id))return peers.get(id);
   const pc=new RTCPeerConnection(rtcConfig);const stream=new MediaStream();
   localStream.getAudioTracks().forEach(t=>pc.addTrack(t,localStream));
   const video=pc.addTransceiver('video',{direction:'sendrecv'});if(videoStream)video.sender.replaceTrack(videoStream.getVideoTracks()[0]);
   const audio=document.createElement('audio');audio.autoplay=true;audio.srcObject=stream;audio.muted=deafened;document.body.append(audio);
-  const p={pc,stream,audio,videoSender:video.sender,candidates:[]};peers.set(id,p);
-  pc.onicecandidate=e=>{if(e.candidate)signal(id,{candidate:e.candidate});};
+  const p={pc,stream,audio,videoSender:video.sender};
+  p.negotiator=createNegotiator(pc,{polite:socket.id>id,send:payload=>signal(id,payload)});peers.set(id,p);
+  pc.onicecandidate=e=>{if(e.candidate)signal(id,{candidate:e.candidate}).catch(error=>{if(peers.get(id)===p)toast(error.message);});};
   pc.ontrack=e=>{stream.addTrack(e.track);audio.play().catch(()=>toast('Нажмите кнопку звука, чтобы разрешить воспроизведение.'));e.track.onunmute=()=>renderCall();e.track.onmute=()=>renderCall();e.track.onended=()=>renderCall();renderCall();};
-  pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed')toast('Не удалось соединиться с участником. Для разных сетей настройте TURN (см. инструкцию).');renderCall();};return p;
+  pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed')toast('Не установлено медиасоединение с участником. Проверьте доступность TURN и сети.');renderCall();};return p;
 }
-async function handleSignal({from,description,candidate}){
-  if(!localStream)return;const p=createPeer(from);
-  if(description){await p.pc.setRemoteDescription(description);for(const c of p.candidates)await p.pc.addIceCandidate(c);p.candidates=[];if(description.type==='offer'){await p.pc.setLocalDescription(await p.pc.createAnswer());signal(from,{description:p.pc.localDescription});}}
-  if(candidate){if(p.pc.remoteDescription)await p.pc.addIceCandidate(candidate);else p.candidates.push(candidate);}
+async function handleSignal({from,room:signalRoom,description,candidate}){
+  if(!localStream||!voiceRoom||signalRoom&&signalRoom!==voiceRoom)return;const p=createPeer(from);
+  await p.negotiator.receive({description,candidate});
 }
 function closePeer(id){const p=peers.get(id);if(p){p.pc.close();p.audio.srcObject=null;p.audio.remove();peers.delete(id);}}
-function leaveCall(){socket?.emit('voice:leave');for(const id of [...peers.keys()])closePeer(id);localStream?.getTracks().forEach(t=>t.stop());videoStream?.getTracks().forEach(t=>t.stop());localStream=null;videoStream=null;videoMode=null;voiceRoom=null;muted=false;deafened=false;dmCallView=false;renderCall();}
+function leaveCall(){
+  loadingVoiceSdk=false;voiceSdkProgress=0;
+  livekitCall?.stop();livekitCall=null;
+  voiceSignaling?.stop();voiceSignaling=null;
+  clearTimeout(callRetryTimer);callIntent=null;callAbort?.abort();callAbort=null;joining=false;$('join-call').disabled=false;
+  if(socket?.connected)socket.emit('voice:leave');
+  for(const id of [...peers.keys()])closePeer(id);localStream?.getTracks().forEach(t=>t.stop());videoStream?.getTracks().forEach(t=>t.stop());localStream=null;videoStream=null;videoMode=null;voiceRoom=null;muted=false;deafened=false;dmCallView=false;renderCall();
+}
 function renderCall(){
-  $('voice-status').hidden=!voiceRoom;const vc=state?.guilds.flatMap(g=>g.channels).find(c=>c.id===voiceRoom)||state?.dms.find(d=>d.id===voiceRoom);
-  $('voice-label').textContent=vc?.name||vc?.display_name||'Личный звонок';$('mute').textContent=muted?'Микрофон выкл.':'Микрофон вкл.';$('deafen').textContent=deafened?'Звук выкл.':'Звук вкл.';
+  const desired=voiceRoom||callIntent;
+  $('voice-status').querySelector('strong').textContent=desired&&!voiceRoom?'● Подключение':'● В звонке';
+  $('voice-status').hidden=!desired;const vc=state?.guilds.flatMap(g=>g.channels).find(c=>c.id===desired)||state?.dms.find(d=>d.id===desired);
+  $('voice-label').textContent=loadingVoiceSdk?'Загрузка звука… '+voiceSdkProgress+'%':(desired&&!voiceRoom?'Подключение… ':livekitCall?.reconnecting?'Восстановление звука… ':'')+(vc?.name||vc?.display_name||'Личный звонок');$('mute').textContent=muted?'Микрофон выкл.':'Микрофон вкл.';$('deafen').textContent=deafened?'Звук выкл.':'Звук вкл.';
   const active=voiceRoom===room?.id;$('join-call').hidden=active;$('camera').hidden=!active;$('screen').hidden=!active;$('camera').textContent=videoMode==='camera'?'Выключить камеру':'Включить камеру';$('screen').textContent=videoMode==='screen'?'Остановить показ':'Показать экран';$('call-title').textContent=room?.name||'Разговор';
-  const grid=$('video-grid');const participants=(state?.voice||[]).filter(v=>v.room===room?.id);
+  const grid=$('video-grid');const participants=(livekitCall&&voiceRoom===room?.id?livekitCall.members():state?.voice||[]).filter(v=>v.room===room?.id);
   // Preserve existing media elements: rebuilding them on every presence event
   // would interrupt playback and create overlapping audio.
   const ids=new Set(participants.map(v=>v.socketId));for(const tile of [...grid.children])if(!ids.has(tile.dataset.peer))tile.remove();
   for(const v of participants){
     let tile=[...grid.children].find(t=>t.dataset.peer===v.socketId);if(!tile){tile=document.createElement('div');tile.className='video-tile';tile.dataset.peer=v.socketId;const avatar=document.createElement('span');avatar.className='avatar';const media=document.createElement('video');media.autoplay=true;media.playsInline=true;const label=document.createElement('span');label.className='video-name';tile.append(avatar,media,label);grid.append(tile);}
-    tile.querySelector('.avatar').textContent=initials(v.user.display_name);const self=v.socketId===socket?.id;const stream=self?videoStream:peers.get(v.socketId)?.stream;const video=tile.querySelector('video');if(video.srcObject!==stream)video.srcObject=stream||null;video.muted=true;
+    tile.querySelector('.avatar').textContent=initials(v.user.display_name);const self=livekitCall?v.user.id===state.user.id:v.socketId===socket?.id;const stream=livekitCall?livekitCall.stream(v.user.id):self?videoStream:peers.get(v.socketId)?.stream;const video=tile.querySelector('video');if(video.srcObject!==stream)video.srcObject=stream||null;video.muted=true;
     const hasVideo=stream?.getVideoTracks().some(t=>t.readyState==='live'&&!t.muted);video.style.opacity=hasVideo?'1':'0';tile.querySelector('.video-name').textContent=`${v.user.display_name}${self?' (вы)':''}${v.muted?' · микрофон выкл.':''}`;
     if(stream)video.play().catch(()=>{});
   }
 }
 async function setVideo(mode){
   if(!voiceRoom)return;
+  if(livekitCall){await livekitCall.video(videoMode===mode?null:mode);videoMode=livekitCall.videoMode;renderCall();return;}
   if(videoMode===mode){await stopVideo();return;}
   if(mode==='screen'&&!navigator.mediaDevices.getDisplayMedia)throw new Error('Показ экрана не поддерживается этим браузером.');
   const stream=mode==='screen'?await navigator.mediaDevices.getDisplayMedia({video:true,audio:false}):await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
@@ -161,7 +254,7 @@ async function setVideo(mode){
   videoStream=stream;videoMode=mode;previous?.getTracks().forEach(t=>t.stop());track.onended=()=>{if(videoStream===stream)stopVideo().catch(e=>toast(e.message));};renderCall();
 }
 async function stopVideo(){await Promise.all([...peers.values()].map(p=>p.videoSender.replaceTrack(null)));videoStream?.getTracks().forEach(t=>t.stop());videoStream=null;videoMode=null;renderCall();}
-$('join-call').onclick=action(()=>startCall(room.id));$('dm-call').onclick=action(async()=>{await startCall(room.id);dmCallView=!dmCallView;renderRoom();});$('hangup').onclick=()=>{leaveCall();renderRoom();};$('mute').onclick=()=>{muted=!muted;localStream?.getAudioTracks().forEach(t=>t.enabled=!muted);socket.emit('voice:mute',muted);renderCall();};$('deafen').onclick=()=>{deafened=!deafened;for(const p of peers.values()){p.audio.muted=deafened;if(!deafened)p.audio.play().catch(()=>{});}renderCall();};$('camera').onclick=action(()=>setVideo('camera'));$('screen').onclick=action(()=>setVideo('screen'));
+$('join-call').onclick=action(()=>startCall(room.id));$('dm-call').onclick=action(async()=>{await startCall(room.id);dmCallView=!dmCallView;renderRoom();});$('hangup').onclick=()=>{leaveCall();renderRoom();};$('mute').onclick=action(async()=>{const next=!muted;if(livekitCall)await livekitCall.mute(next);muted=next;localStream?.getAudioTracks().forEach(t=>t.enabled=!muted);if(socket.connected)socket.emit('voice:mute',muted);renderCall();});$('deafen').onclick=action(async()=>{const next=!deafened;if(livekitCall)await livekitCall.deafen(next);deafened=next;for(const p of peers.values()){p.audio.muted=deafened;if(!deafened)p.audio.play().catch(()=>{});}renderCall();});$('camera').onclick=action(()=>setVideo('camera'));$('screen').onclick=action(()=>setVideo('screen'));
 $('voice-label').onclick=action(async()=>{if(!voiceRoom)return;await selectRoom(voiceRoom);if(room.kind==='dm'){dmCallView=true;renderRoom();}});
 window.addEventListener('beforeunload',()=>{localStream?.getTracks().forEach(t=>t.stop());videoStream?.getTracks().forEach(t=>t.stop());});
 boot().catch(e=>{if(e.message!=='Войдите в аккаунт')toast(e.message);});

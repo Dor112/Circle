@@ -1,7 +1,13 @@
 node_modules
 data
 .env
+.livekit.env
 .git
 tests
 test-results
 docs
+transfer-check
+*.zip
+certs
+*.pem
+*.enc

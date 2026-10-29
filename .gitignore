@@ -1,5 +1,11 @@
 node_modules/
 data/
 .env
+.livekit.env
 test-results/
 *.log
+transfer-check/
+krug-vps-clean.zip
+certs/
+*.pem
+*.enc

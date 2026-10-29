@@ -8,6 +8,26 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import multer from 'multer';
+import { AccessToken, RoomConfiguration, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
+
+const livekitEnabled=process.env.VOICE_PROVIDER==='livekit';
+let livekitUrl,livekitService;
+if(livekitEnabled){
+  const endpoint=new URL(process.env.LIVEKIT_URL||'');
+  if(endpoint.protocol!=='wss:'||endpoint.username||endpoint.password||endpoint.search||endpoint.hash||endpoint.pathname!=='/')throw new Error('LIVEKIT_URL должен быть адресом wss:// сервера LiveKit');
+  if(!process.env.LIVEKIT_API_KEY||!process.env.LIVEKIT_API_SECRET)throw new Error('Задайте LIVEKIT_API_KEY и LIVEKIT_API_SECRET');
+  livekitUrl=endpoint.origin;
+  livekitService=new RoomServiceClient(livekitUrl.replace(/^wss:/,'https:'),process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET,{requestTimeout:5});
+}
+const livekitLeases=new Map();
+function revokeLivekit(uid,allowed=()=>true){
+  const rooms=livekitLeases.get(uid);if(!rooms)return;
+  for(const id of [...rooms])if(allowed(id)){
+    rooms.delete(id);
+    livekitService.removeParticipant(`krug-${id}`,uid).catch(()=>console.error('Не удалось подтвердить отключение участника LiveKit'));
+  }
+  if(!rooms.size)livekitLeases.delete(uid);
+}
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const data = path.resolve(process.env.DATA_DIR || path.join(root, 'data'));
@@ -47,7 +67,8 @@ const app = express();
 if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use((req,res,next) => {
-  res.set({ 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'same-origin', 'X-Frame-Options':'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" });
+  res.set({ 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'same-origin', 'X-Frame-Options':'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" });
+  if(livekitEnabled)res.set('Content-Security-Policy',res.get('Content-Security-Policy').replace("script-src 'self'","script-src 'self' blob:").replace("connect-src 'self' ws: wss:",`connect-src 'self' ws: wss: ${livekitUrl.replace(/^wss:/,'https:')} https://*.livekit.cloud`));
   if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.headers.origin && req.headers.origin !== (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`)) return res.status(403).json({ error:'Недопустимый источник запроса' });
   next();
 });
@@ -67,31 +88,41 @@ function login(res, uid) {
   res.cookie('krug',token,{ httpOnly:true, sameSite:'strict', secure:process.env.COOKIE_SECURE==='1', maxAge:30*86400_000, path:'/' });
 }
 app.get('/api/health', (req,res)=>res.json({ok:true}));
-app.post('/api/auth/:action', async (req,res,next)=>{try{
+async function authenticate(req, action) {
   limited(`auth:${req.ip}`,20,15*60_000);
-  const username=str(req.body.username,3,32).toLowerCase();
+  const username=str(req.body?.username,3,32).toLowerCase();
   if(!/^[a-z0-9_]+$/.test(username)) fail(400,'Логин: латинские буквы, цифры и _');
   const password=req.body.password;
   if(typeof password!=='string'||password.length<10||password.length>128)fail(400,'Пароль должен содержать от 10 до 128 символов');
-  if(req.params.action==='register') {
+  if(action==='register') {
     if(process.env.ALLOW_REGISTRATION==='0') fail(403,'Регистрация закрыта');
     if(get('SELECT 1 FROM users WHERE username=?',username)) fail(409,'Логин уже занят');
     const salt=randomBytes(16).toString('hex'), derived=await promisify(scrypt)(password,salt,64);
     const uid=randomUUID();
     try{run('INSERT INTO users(id,username,display_name,password) VALUES(?,?,?,?)',uid,username,str(req.body.display_name || username,1,40),`${salt}:${derived.toString('hex')}`);}catch(e){if(String(e).includes('UNIQUE'))fail(409,'Логин уже занят');throw e;}
-    login(res,uid); return res.json(publicUser(get('SELECT * FROM users WHERE id=?',uid)));
+    return get('SELECT * FROM users WHERE id=?',uid);
   }
-  if(req.params.action!=='login') fail(404,'Не найдено');
+  if(action!=='login') fail(404,'Не найдено');
   const u=get('SELECT * FROM users WHERE username=?',username);
   const [salt,expected]=(u?.password || `${'0'.repeat(32)}:${'0'.repeat(128)}`).split(':');
   const actual=await promisify(scrypt)(password,salt,64);
   if(!u || !timingSafeEqual(actual,Buffer.from(expected,'hex'))) fail(401,'Неверный логин или пароль');
+  return u;
+}
+app.post('/api/auth/:action', async (req,res,next)=>{try{
+  const u=await authenticate(req,req.params.action);
   login(res,u.id);res.json(publicUser(u));
 }catch(e){next(e);}});
+// Native form fallback when the browser has not loaded the JavaScript handler.
+app.post('/',express.urlencoded({extended:false,limit:'32kb'}),async(req,res,next)=>{try{
+  const u=await authenticate(req,req.body?.auth_action || 'login');
+  login(res,u.id);res.set('Cache-Control','no-store').redirect(303,'/');
+}catch(e){next(e);}});
 app.use('/api',(req,res,next)=>{req.user=session(req);if(!req.user)return res.status(401).json({error:'Войдите в аккаунт'});next();});
-app.post('/api/logout',(req,res)=>{run('DELETE FROM sessions WHERE token=?',req.user.session_token);for(const s of io.sockets.sockets.values())if(s.sessionToken===req.user.session_token)s.disconnect(true);res.clearCookie('krug',{path:'/'}).json({ok:true});});
+app.post('/api/logout',(req,res)=>{revokeLivekit(req.user.id);run('DELETE FROM sessions WHERE token=?',req.user.session_token);for(const s of io.sockets.sockets.values())if(s.sessionToken===req.user.session_token)s.disconnect(true);res.clearCookie('krug',{path:'/'}).json({ok:true});});
 const online = new Map();
 const voice = new Map();
+const voiceMail = new Map();
 function state(uid) {
   const guilds=all('SELECT g.* FROM guilds g JOIN members m ON m.guild_id=g.id WHERE m.user_id=?',uid).map(g=>({...g,channels:all('SELECT * FROM channels WHERE guild_id=? ORDER BY rowid',g.id),members:all('SELECT u.id,u.username,u.display_name FROM users u JOIN members m ON m.user_id=u.id WHERE m.guild_id=?',g.id).map(u=>({...u,online:online.has(u.id)}))}));
   const dms=all('SELECT c.id,u.id AS user_id,u.username,u.display_name FROM conversations c JOIN users u ON u.id=CASE WHEN c.a=? THEN c.b ELSE c.a END WHERE c.a=? OR c.b=?',uid,uid,uid);
@@ -112,12 +143,19 @@ app.post('/api/invites/:code',(req,res)=>{const inv=get('SELECT * FROM invites W
 app.delete('/api/guilds/:gid/members/:uid',(req,res)=>{
   const {gid,uid}=req.params; const g=get('SELECT * FROM guilds WHERE id=?',gid);if(!g)fail(404,'Сервер не найден');if(uid!==req.user.id)owner(req.user.id,gid);if(g.owner_id===uid)fail(400,'Владелец не может покинуть свой сервер');
   run('DELETE FROM members WHERE guild_id=? AND user_id=?',gid,uid);
+  revokeLivekit(uid,id=>!!get('SELECT 1 FROM channels WHERE id=? AND guild_id=?',id,gid));
   for(const s of io.sockets.sockets.values())if(s.user.id===uid){for(const room of s.rooms)if(get('SELECT 1 FROM channels WHERE id=? AND guild_id=?',room,gid))s.leave(room);if(voice.get(s.id)&&get('SELECT 1 FROM channels WHERE id=? AND guild_id=?',voice.get(s.id).room,gid)){leaveVoice(s);s.emit('voice:kicked');}}
   refresh(uid);refreshGuild(gid);res.json({ok:true});
 });
 app.post('/api/dms',(req,res)=>{const u=get('SELECT * FROM users WHERE username=?',str(req.body.username,3,32));if(!u)fail(404,'Пользователь не найден');if(u.id===req.user.id)fail(400,'Укажите логин друга');const [a,b]=[req.user.id,u.id].sort();run('INSERT OR IGNORE INTO conversations VALUES(?,?,?)',randomUUID(),a,b);const c=get('SELECT * FROM conversations WHERE a=? AND b=?',a,b);refresh(a);refresh(b);res.json({id:c.id});});
 function message(row) {return {...row,author:publicUser(get('SELECT * FROM users WHERE id=?',row.author_id)),attachment:row.attachment?get('SELECT id,name,size FROM uploads WHERE id=?',row.attachment):null,reactions:all('SELECT emoji,user_id FROM reactions WHERE message_id=?',row.id)};}
-app.get('/api/rooms/:id/messages',(req,res)=>{if(!roomAccess(req.user.id,req.params.id))fail(403,'Нет доступа');const before=Number(req.query.before)||Number.MAX_SAFE_INTEGER;const search=String(req.query.search||'').slice(0,100);res.json(all('SELECT * FROM messages WHERE room=? AND id<? AND instr(fold(body),fold(?))>0 ORDER BY id DESC LIMIT 50',req.params.id,before,search).reverse().map(message));});
+function history(uid,id,query={}) {
+  if(!roomAccess(uid,id))fail(403,'Нет доступа');
+  const before=Number(query.before)||Number.MAX_SAFE_INTEGER;
+  const search=String(query.search||'').slice(0,100);
+  return all('SELECT * FROM messages WHERE room=? AND id<? AND instr(fold(body),fold(?))>0 ORDER BY id DESC LIMIT 50',id,before,search).reverse().map(message);
+}
+app.get('/api/rooms/:id/messages',(req,res)=>res.json(history(req.user.id,req.params.id,req.query)));
 app.post('/api/rooms/:id/messages',(req,res)=>{
   const c=roomAccess(req.user.id,req.params.id);if(!c)fail(403,'Нет доступа');if(c.kind==='voice')fail(400,'Выберите текстовый канал');limited(`msg:${req.user.id}`,40,10_000);
   const body=req.body.body?str(req.body.body,1,4000):'';const attachment=req.body.attachment || null;
@@ -131,28 +169,96 @@ app.post('/api/messages/:id/reactions',(req,res)=>{const m=get('SELECT * FROM me
 const upload=multer({storage:multer.diskStorage({destination:path.join(data,'uploads'),filename:(req,file,cb)=>cb(null,randomUUID())}),limits:{fileSize:10*1024*1024,files:1}});
 app.post('/api/uploads',(req,res,next)=>{limited(`upload:${req.user.id}`,20,60_000);next();},upload.single('file'),(req,res)=>{if(!req.file)fail(400,'Выберите файл');const f=req.file;run('INSERT INTO uploads VALUES(?,?,?,?)',f.filename,req.user.id,path.basename(f.originalname).slice(0,180),f.size);res.json({id:f.filename,name:f.originalname,size:f.size});});
 app.get('/api/uploads/:id',(req,res)=>{const f=get('SELECT * FROM uploads WHERE id=?',req.params.id);if(!f)fail(404,'Файл не найден');if(f.owner_id!==req.user.id&&!all('SELECT room FROM messages WHERE attachment=?',f.id).some(m=>roomAccess(req.user.id,m.room)))fail(403,'Нет доступа');res.set('Content-Security-Policy',"default-src 'none'; sandbox");res.download(path.join(data,'uploads',f.id),f.name);});
-app.get('/api/rtc',(req,res)=>{const iceServers=[{urls:process.env.STUN_URL || 'stun:stun.l.google.com:19302'}];if(process.env.TURN_URL){const username=`${Math.floor(Date.now()/1000)+86400}:${req.user.id}`;const credential=process.env.TURN_SECRET?createHmac('sha1',process.env.TURN_SECRET).update(username).digest('base64'):process.env.TURN_PASSWORD;iceServers.push({urls:process.env.TURN_URL.split(','),username:process.env.TURN_SECRET?username:process.env.TURN_USERNAME,credential});}res.json({iceServers});});
+function rtcConfig(uid){if(livekitEnabled)return {provider:'livekit'};const iceServers=[{urls:process.env.STUN_URL || 'stun:stun.l.google.com:19302'}];if(process.env.TURN_URL){const username=`${Math.floor(Date.now()/1000)+86400}:${uid}`;const credential=process.env.TURN_SECRET?createHmac('sha1',process.env.TURN_SECRET).update(username).digest('base64'):process.env.TURN_PASSWORD;iceServers.push({urls:process.env.TURN_URL.split(','),username:process.env.TURN_SECRET?username:process.env.TURN_USERNAME,credential});}return {iceServers};}
+app.get('/api/rtc',(req,res)=>res.json(rtcConfig(req.user.id)));
+app.post('/api/rooms/:id/livekit',async(req,res)=>{
+  if(!livekitEnabled)fail(503,'LiveKit не настроен');
+  const c=roomAccess(req.user.id,req.params.id);if(!c||c.kind==='text')fail(403,'Голосовой канал недоступен');
+  const s=voiceSocket(req);if(voice.get(s.id).room!==req.params.id)fail(403,'Войдите в этот голосовой канал');
+  limited(`livekit:${req.user.id}`,12,60_000);
+  const token=new AccessToken(process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET,{identity:req.user.id,name:req.user.display_name,ttl:120});
+  token.addGrant({roomJoin:true,room:`krug-${req.params.id}`,canPublish:true,canSubscribe:true,canPublishData:false,canPublishSources:[TrackSource.MICROPHONE,TrackSource.CAMERA,TrackSource.SCREEN_SHARE]});
+  token.roomConfig=new RoomConfiguration({maxParticipants:8,emptyTimeout:60});
+  const jwt=await token.toJwt();
+  if(!roomAccess(req.user.id,req.params.id)||!session(req))fail(403,'Нет доступа');
+  let rooms=livekitLeases.get(req.user.id);if(!rooms){rooms=new Set();livekitLeases.set(req.user.id,rooms);}rooms.add(req.params.id);
+  res.set('Cache-Control','no-store').json({url:livekitUrl,token:jwt});
+});
 function emitVoice() {for(const s of io.sockets.sockets.values())s.emit('voice:state',[...voice].filter(([,v])=>roomAccess(s.user.id,v.room)).map(([socketId,v])=>({socketId,...v})));}
-function leaveVoice(s) {const v=voice.get(s.id);if(v){voice.delete(s.id);s.to(`voice:${v.room}`).emit('voice:left',{socketId:s.id});s.leave(`voice:${v.room}`);emitVoice();}}
+function leaveVoice(s) {voiceMail.delete(s.id);const v=voice.get(s.id);if(v){voice.delete(s.id);s.to(`voice:${v.room}`).emit('voice:left',{socketId:s.id});s.leave(`voice:${v.room}`);emitVoice();}}
+function voiceSocket(req){
+  const s=io.sockets.sockets.get(req.body?.socketId);
+  if(!s||s.user.id!==req.user.id||s.sessionToken!==req.user.session_token||!voice.has(s.id)||!roomAccess(req.user.id,voice.get(s.id).room))fail(403,'Войдите в голосовой канал снова');
+  return s;
+}
+function liveMail(s){
+  const box=voiceMail.get(s.id)||new Map(),now=Date.now(),room=voice.get(s.id)?.room;
+  for(const [id,item]of box)if(item.expires<now||voice.get(item.message.from)?.room!==room||!roomAccess(voice.get(item.message.from)?.user.id,room))box.delete(id);
+  voiceMail.set(s.id,box);return box;
+}
+function queueVoiceSignal(s,payload){
+  const {to,description,candidate}=payload||{},a=voice.get(s.id),b=voice.get(to);
+  if(!a||!b||a.room!==b.room||!roomAccess(s.user.id,a.room)||!roomAccess(b.user.id,b.room))fail(403,'Нет доступа');
+  const key=`${s.id}:${payload.id===undefined?randomUUID():str(payload.id,1,80)}`,message={id:key,from:s.id,room:a.room};
+  if(description){
+    if(!['offer','answer'].includes(description.type)||typeof description.sdp!=='string'||description.sdp.length>20000)fail(400,'Некорректные параметры звонка');
+    message.description={type:description.type,sdp:description.sdp};
+  }else if(candidate){
+    if(typeof candidate.candidate!=='string'||candidate.candidate.length>2000||candidate.sdpMid!=null&&(typeof candidate.sdpMid!=='string'||candidate.sdpMid.length>32)||candidate.sdpMLineIndex!=null&&(!Number.isInteger(candidate.sdpMLineIndex)||candidate.sdpMLineIndex<0||candidate.sdpMLineIndex>32)||candidate.usernameFragment!=null&&(typeof candidate.usernameFragment!=='string'||candidate.usernameFragment.length>256))fail(400,'Некорректный ICE-кандидат');
+    message.candidate={candidate:candidate.candidate,sdpMid:candidate.sdpMid,sdpMLineIndex:candidate.sdpMLineIndex,usernameFragment:candidate.usernameFragment};
+  }else fail(400,'Нет параметров звонка');
+  const target=io.sockets.sockets.get(to);if(!target)fail(403,'Участник отключился');
+  const box=liveMail(target);
+  if(!box.has(key)){
+    const bytes=Buffer.byteLength(JSON.stringify(message));
+    if(box.size>=128||[...box.values()].reduce((sum,item)=>sum+item.bytes,bytes)>262144)fail(429,'Участник не получает параметры звонка');
+    box.set(key,{message,bytes,expires:Date.now()+30000});
+  }
+  io.to(to).emit('voice:signal',box.get(key).message);return {ok:true};
+}
+app.post('/api/voice/signals',(req,res)=>{const s=voiceSocket(req);res.set('Cache-Control','no-store').json(queueVoiceSignal(s,req.body));});
+app.post('/api/voice/signals/read',(req,res)=>{
+  const s=voiceSocket(req),box=liveMail(s),ack=req.body.ack||[];
+  if(!Array.isArray(ack)||ack.length>256||ack.some(id=>typeof id!=='string'||id.length>128))fail(400,'Некорректное подтверждение');
+  for(const id of ack)box.delete(id);
+  // A single signal keeps fallback responses small on unstable connections.
+  res.set('Cache-Control','no-store').json({messages:[...box.values()].slice(0,1).map(item=>item.message)});
+});
 io.use((s,next)=>{const u=session(s.request);if(!u)return next(new Error('Войдите в аккаунт'));s.user=publicUser(u);s.sessionToken=u.session_token;next();});
 io.on('connection',s=>{
   const uid=s.user.id; s.join(`user:${uid}`);online.set(uid,(online.get(uid)||0)+1);
   for(const m of all('SELECT guild_id FROM members WHERE user_id=?',uid))refreshGuild(m.guild_id);
   const guard=fn=>(payload,ack=()=>{})=>{try{if(!get('SELECT 1 FROM sessions WHERE token=? AND expires>?',s.sessionToken,Date.now())){s.disconnect(true);return;}limited(`ws:${s.id}`,180,10_000);fn(payload,ack);}catch(e){ack({error:e.status?e.message:'Ошибка события'});}};
+  s.on('data:read',guard((payload,ack)=>{
+    const value=str(payload?.path,1,512);
+    if(!value.startsWith('/')||value.startsWith('//'))fail(400,'Неверный путь');
+    const url=new URL(value,'http://local');
+    let data;
+    if(url.pathname==='/state')data=state(uid);
+    else if(url.pathname==='/rtc')data=rtcConfig(uid);
+    else {
+      const match=/^\/rooms\/([^/]+)\/messages$/.exec(url.pathname);
+      if(!match)fail(404,'Маршрут не найден');
+      data=history(uid,match[1],Object.fromEntries(url.searchParams));
+    }
+    ack({data});
+  }));
   s.on('room:join',guard((id,ack)=>{if(!roomAccess(uid,id))fail(403,'Нет доступа');for(const r of s.rooms)if(!r.startsWith('user:')&&!r.startsWith('voice:')&&r!==s.id)s.leave(r);s.join(id);ack({ok:true});}));
   s.on('typing',guard(id=>{if(roomAccess(uid,id))s.to(id).emit('typing',{room:id,user:s.user});}));
   s.on('voice:join',guard((room,ack)=>{
     const c=roomAccess(uid,room);if(!c||c.kind==='text')fail(403,'Голосовой канал недоступен');
+    if(voice.get(s.id)?.room===room){ack({peers:[...voice].filter(([sid,v])=>sid!==s.id&&v.room===room).map(([socketId,v])=>({socketId,...v}))});return;}
     if([...voice.values()].filter(v=>v.room===room).length>=8)fail(400,'В голосовом канале уже 8 участников');
-    for(const [sid,v] of voice)if(v.user.id===uid){const old=io.sockets.sockets.get(sid);leaveVoice(old);old.emit('voice:kicked');}
+    for(const [sid,v] of voice)if(sid!==s.id&&v.user.id===uid){const old=io.sockets.sockets.get(sid);leaveVoice(old);old.emit('voice:kicked');}
     leaveVoice(s);const peers=[...voice].filter(([,v])=>v.room===room).map(([socketId,v])=>({socketId,...v}));voice.set(s.id,{room,user:s.user,muted:false});s.join(`voice:${room}`);ack({peers});emitVoice();
   }));
-  s.on('voice:signal',guard(({to,description,candidate},ack)=>{const a=voice.get(s.id),b=voice.get(to);if(!a||!b||a.room!==b.room||!roomAccess(uid,a.room))fail(403,'Нет доступа');io.to(to).emit('voice:signal',{from:s.id,description,candidate});ack({ok:true});}));
+  s.on('voice:signal',guard((payload,ack)=>ack(queueVoiceSignal(s,payload))));
   s.on('voice:mute',guard(value=>{if(voice.has(s.id)){voice.get(s.id).muted=!!value;emitVoice();}}));
   s.on('voice:leave',()=>leaveVoice(s));
   s.on('disconnect',()=>{leaveVoice(s);const n=(online.get(uid)||1)-1;if(n)online.set(uid,n);else online.delete(uid);for(const m of all('SELECT guild_id FROM members WHERE user_id=?',uid))refreshGuild(m.guild_id);});
 });
 app.use('/api',(req,res)=>res.status(404).json({error:'Маршрут не найден'}));
+app.get('/vendor/livekit-client-2.23.0.js',(req,res,next)=>{if(!req.acceptsEncodings('gzip'))return next();res.set({'Content-Encoding':'gzip','Content-Type':'application/javascript','Vary':'Accept-Encoding'}).sendFile(path.join(root,'public/vendor/livekit-client-2.23.0.js.gz'),error=>{if(error){res.removeHeader('Content-Encoding');res.removeHeader('Content-Type');next(error);}});});
 app.use(express.static(path.join(root,'public')));
 app.use((err,req,res,next)=>{if(!err.status&&!(err instanceof multer.MulterError))console.error(err);res.status(err.status || (err instanceof multer.MulterError?400:500)).json({error:err.status?err.message:err instanceof multer.MulterError?'Файл слишком большой (максимум 10 МБ)':'Ошибка сервера'});});
 const port=Number(process.env.PORT || 3000);

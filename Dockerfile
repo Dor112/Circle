@@ -5,6 +5,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY server.js ./
 COPY public ./public
 RUN mkdir -p /app/data && chown -R node:node /app/data
+# Archives extracted as root with umask 077 can create private directories.
+# Only public assets need to be readable/traversable by the runtime user.
+RUN chmod -R a+rX /app/public
 USER node
 ENV NODE_ENV=production PORT=3000 DATA_DIR=/app/data
 EXPOSE 3000
